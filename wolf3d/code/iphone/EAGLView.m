@@ -1,3 +1,4 @@
+#include "gles_glue.h"
 /*
  
  Copyright (C) 2009-2011 id Software LLC, a ZeniMax Media company. 
@@ -175,6 +176,7 @@ EAGLView *eaglview = nil;
     if (context && !defaultFramebuffer)
     {
         [EAGLContext setCurrentContext:context];
+	R_GLES2_Init();
 		
         // Create default framebuffer object.
         glGenFramebuffersOES(1, &defaultFramebuffer);
@@ -211,6 +213,7 @@ EAGLView *eaglview = nil;
     if (context)
     {
         [EAGLContext setCurrentContext:context];
+	R_GLES2_Init();
         
         if (defaultFramebuffer)
         {
@@ -237,6 +240,7 @@ EAGLView *eaglview = nil;
     if (context)
     {
         [EAGLContext setCurrentContext:context];
+	R_GLES2_Init();
         
         if (!defaultFramebuffer)
             [self createFramebuffer];
@@ -254,6 +258,7 @@ EAGLView *eaglview = nil;
     if (context)
     {
         [EAGLContext setCurrentContext:context];
+	R_GLES2_Init();
 		
 		//glBindRenderbufferOES(GL_RENDERBUFFER_OES, colorRenderbuffer);
 		

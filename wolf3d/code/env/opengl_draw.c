@@ -1,3 +1,4 @@
+#include "gles_glue.h"
 /*
 
 	Copyright (C) 2004-2005 Michael Liebscher <johnnycanuck@users.sourceforge.net>
