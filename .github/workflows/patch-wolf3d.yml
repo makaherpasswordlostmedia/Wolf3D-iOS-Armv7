@@ -1,55 +1,144 @@
-name: Patch Wolf3D-iOS (ARMv7 + GLES2)
+name: Patch Wolf3D-iOS (ARMv7 + GLES2) → build IPA for iOS 4.3
 
 on:
   workflow_dispatch:
 
-# Даём токену права на запись
 permissions:
   contents: write
 
 jobs:
-  patch:
-    runs-on: macos-latest
+  patch-and-build:
+    # macos-13 = последний runner с Xcode 14.x, который ещё знает armv7
+    # Xcode 14 убрал armv7 из стандартной сборки, но clang сам по себе
+    # его поддерживает — обходим через xcconfig и старый SDK
+    runs-on: macos-13
 
     steps:
-      - name: Checkout repository
+      # -----------------------------------------------------------------------
+      # 0. Checkout
+      # -----------------------------------------------------------------------
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       # -----------------------------------------------------------------------
-      # 1. project.pbxproj — ARMv7 only
+      # 1. Выбираем самый старый доступный Xcode (13.x на macos-13)
       # -----------------------------------------------------------------------
-      - name: Patch project.pbxproj (ARMv7 only)
+      - name: Select oldest available Xcode
+        run: |
+          echo "=== Available Xcode versions ==="
+          ls /Applications/ | grep Xcode
+
+          # Берём Xcode 13.x если есть, иначе любой
+          XCODE_PATH=$(ls -d /Applications/Xcode_13*.app 2>/dev/null | sort -V | head -1)
+          if [ -z "$XCODE_PATH" ]; then
+            XCODE_PATH=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | head -1)
+          fi
+
+          echo "Using: $XCODE_PATH"
+          sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
+          xcodebuild -version
+
+      # -----------------------------------------------------------------------
+      # 2. Скачиваем iPhoneOS4.3.sdk из неофициального архива
+      #    (theos-sdks — популярный источник старых SDK для jailbreak-разработки)
+      # -----------------------------------------------------------------------
+      - name: Download iPhoneOS4.3.sdk
+        run: |
+          XCODE_SDKS=$(xcrun --show-sdk-platform-path | sed 's|/iPhoneOS.platform||')/iPhoneOS.platform/Developer/SDKs
+          echo "SDK dir: $XCODE_SDKS"
+
+          # Скачиваем SDK архив с theos-sdks (GitHub)
+          echo "Downloading iPhoneOS4.3.sdk..."
+          curl -L \
+            "https://github.com/theos/sdks/archive/refs/heads/master.zip" \
+            -o /tmp/theos-sdks.zip
+
+          cd /tmp && unzip -q theos-sdks.zip
+
+          if [ -d "/tmp/sdks-master/iPhoneOS4.3.sdk" ]; then
+            sudo cp -R /tmp/sdks-master/iPhoneOS4.3.sdk "$XCODE_SDKS/"
+            echo "✅ iPhoneOS4.3.sdk installed to $XCODE_SDKS"
+          else
+            echo "=== Available SDKs in archive ==="
+            ls /tmp/sdks-master/
+            # Берём ближайший доступный (минимальный)
+            OLDEST_SDK=$(ls -d /tmp/sdks-master/iPhoneOS*.sdk 2>/dev/null | sort -V | head -1)
+            if [ -n "$OLDEST_SDK" ]; then
+              SDK_NAME=$(basename "$OLDEST_SDK")
+              sudo cp -R "$OLDEST_SDK" "$XCODE_SDKS/"
+              echo "✅ $SDK_NAME installed (oldest available)"
+              # Обновим deployment target в pbxproj под этот SDK
+              SDK_VER=$(echo "$SDK_NAME" | grep -oE '[0-9]+\.[0-9]+')
+              echo "SDK_VERSION=$SDK_VER" >> $GITHUB_ENV
+            else
+              echo "⚠️  No old SDK found in theos/sdks, will use current SDK with lowered deployment target"
+              SDK_VER=$(xcrun --sdk iphoneos --show-sdk-version)
+              echo "SDK_VERSION=$SDK_VER" >> $GITHUB_ENV
+            fi
+          fi
+
+          # Проверяем доступные SDK
+          echo "=== Installed SDKs ==="
+          xcodebuild -showsdks | grep iphoneos || true
+
+      # -----------------------------------------------------------------------
+      # 3. Patch project.pbxproj
+      # -----------------------------------------------------------------------
+      - name: Patch project.pbxproj (ARMv7 + deployment target)
         run: |
           PBXPROJ="wolf3d/code/iphone/wolf3d.xcodeproj/project.pbxproj"
+          SDK_VER="${SDK_VERSION:-4.3}"
+
           perl -i -pe '
             s/ARCHS\s*=\s*"[^"]*";/ARCHS = armv7;/g;
             s/ARCHS\s*=\s*\$\(ARCHS_STANDARD[^)]*\);/ARCHS = armv7;/g;
             s/ARCHS\s*=\s*\S+;(?!\s*\/)/ARCHS = armv7;/g;
             s/VALID_ARCHS\s*=\s*"[^"]*";/VALID_ARCHS = armv7;/g;
             s/VALID_ARCHS\s*=\s*\S+;(?!\s*\/)/VALID_ARCHS = armv7;/g;
-            s/IPHONEOS_DEPLOYMENT_TARGET\s*=\s*[\d.]+;/IPHONEOS_DEPLOYMENT_TARGET = 4.3;/g;
             s/TARGETED_DEVICE_FAMILY\s*=\s*"1,2";/TARGETED_DEVICE_FAMILY = 1;/g;
             s/TARGETED_DEVICE_FAMILY\s*=\s*2;/TARGETED_DEVICE_FAMILY = 1;/g;
+            s/CODE_SIGN_IDENTITY\s*=\s*"[^"]*";\s*//g;
+            s/PROVISIONING_PROFILE\s*=\s*"[^"]*";\s*//g;
+            s/PROVISIONING_PROFILE_SPECIFIER\s*=\s*"[^"]*";\s*//g;
           ' "$PBXPROJ"
-          python3 - <<'PYEOF'
-          import re
+
+          # Deployment target
+          ESCAPED_VER=$(echo "$SDK_VER" | sed 's/\./\\./g')
+          perl -i -pe "s/IPHONEOS_DEPLOYMENT_TARGET\\s*=\\s*[\\d.]+;/IPHONEOS_DEPLOYMENT_TARGET = $SDK_VER;/g;" "$PBXPROJ"
+
+          python3 - <<PYEOF
+          import re, os
           path = "wolf3d/code/iphone/wolf3d.xcodeproj/project.pbxproj"
+          sdk_ver = os.environ.get("SDK_VERSION", "4.3")
           with open(path,"r",encoding="utf-8") as f: content=f.read()
-          def inject_archs(m):
+
+          def inject_settings(m):
               block=m.group(0)
-              if "ARCHS" not in block:
-                  block=block.replace("buildSettings = {",
-                      "buildSettings = {\n\t\t\t\tARCHS = armv7;\n\t\t\t\tVALID_ARCHS = armv7;",1)
+              changes = {
+                  "ARCHS": "armv7",
+                  "VALID_ARCHS": "armv7",
+                  "IPHONEOS_DEPLOYMENT_TARGET": sdk_ver,
+                  "CODE_SIGNING_ALLOWED": "NO",
+                  "CODE_SIGNING_REQUIRED": "NO",
+                  "AD_HOC_CODE_SIGNING_ALLOWED": "YES",
+              }
+              for key, val in changes.items():
+                  if key not in block:
+                      block = block.replace("buildSettings = {",
+                          f"buildSettings = {{\n\t\t\t\t{key} = {val};", 1)
               return block
-          new=re.sub(r'isa = XCBuildConfiguration;.*?buildSettings = \{.*?\}',inject_archs,content,flags=re.DOTALL)
+
+          new = re.sub(
+              r'isa = XCBuildConfiguration;.*?buildSettings = \{.*?\}',
+              inject_settings, content, flags=re.DOTALL)
           with open(path,"w",encoding="utf-8") as f: f.write(new)
+          print(f"pbxproj patched, deployment target = {sdk_ver}")
           PYEOF
-          echo "project.pbxproj patched"
 
       # -----------------------------------------------------------------------
-      # 2. gles_glue.h
+      # 4. gles_glue.h
       # -----------------------------------------------------------------------
       - name: Write gles_glue.h
         run: |
@@ -115,7 +204,7 @@ jobs:
           EOF
 
       # -----------------------------------------------------------------------
-      # 3. gles_glue.c — полная ES2 реализация
+      # 5. gles_glue.c
       # -----------------------------------------------------------------------
       - name: Write gles_glue.c
         run: |
@@ -139,9 +228,8 @@ jobs:
           static float*CurMat(void){return(g_matMode==MM_PROJECTION)?g_matPR[g_prDepth]:g_matMV[g_mvDepth];}
           static void mat_identity(float*m){memset(m,0,64);m[0]=m[5]=m[10]=m[15]=1.f;}
           static void mat_mul(float*out,const float*a,const float*b){
-            float t[16];
-            for(int r=0;r<4;r++)for(int c=0;c<4;c++){
-              float s=0;for(int k=0;k<4;k++)s+=a[r+k*4]*b[k+c*4];t[r+c*4]=s;}
+            float t[16];int r,c,k;
+            for(r=0;r<4;r++)for(c=0;c<4;c++){float s=0;for(k=0;k<4;k++)s+=a[r+k*4]*b[k+c*4];t[r+c*4]=s;}
             memcpy(out,t,64);}
           static GLuint g_prog=0,g_vbo=0;
           static GLint g_aPos=-1,g_aTC=-1,g_aCol=-1,g_uMVP=-1,g_uTex=-1,g_uMode=-1,g_uARef=-1;
@@ -294,10 +382,11 @@ jobs:
           EOF
 
       # -----------------------------------------------------------------------
-      # 4. EAGLView.m
+      # 6. EAGLView.m / .h, renderer sources
       # -----------------------------------------------------------------------
-      - name: Patch EAGLView.m
+      - name: Patch EAGLView and renderer sources
         run: |
+          # EAGLView.m
           F="wolf3d/code/iphone/EAGLView.m"
           perl -i -pe '
             s/kEAGLRenderingAPIOpenGLES1/kEAGLRenderingAPIOpenGLES2/g;
@@ -315,22 +404,14 @@ jobs:
           with open(path,'w') as f: f.write(src)
           "
 
-      # -----------------------------------------------------------------------
-      # 5. EAGLView.h
-      # -----------------------------------------------------------------------
-      - name: Patch EAGLView.h
-        run: |
+          # EAGLView.h
           perl -i -pe '
             s|<OpenGLES/ES1/gl\.h>|<OpenGLES/ES2/gl.h>|g;
             s|<OpenGLES/ES1/glext\.h>|<OpenGLES/ES2/glext.h>|g;
             s/kEAGLRenderingAPIOpenGLES1/kEAGLRenderingAPIOpenGLES2/g;
           ' wolf3d/code/iphone/EAGLView.h
 
-      # -----------------------------------------------------------------------
-      # 6. Renderer sources
-      # -----------------------------------------------------------------------
-      - name: Patch renderer sources
-        run: |
+          # Renderer sources
           for f in \
             wolf3d/code/env/opengl_main.c \
             wolf3d/code/env/opengl_draw.c \
@@ -351,50 +432,65 @@ jobs:
             "
           done
 
-      # -----------------------------------------------------------------------
-      # 7. opengl_draw.c — R_Draw_Fill -> mode 1
-      # -----------------------------------------------------------------------
-      - name: Patch opengl_draw.c render modes
-        run: |
+          # Render modes
           python3 - <<'PYEOF'
           import re
           path = "wolf3d/code/env/opengl_draw.c"
           try:
               with open(path,"r") as f: src=f.read()
-          except: exit(0)
-          if "R_GLES2_SetRenderMode(1)" not in src:
-              def patch_fill(m):
-                  body=m.group(0)
-                  if "R_GLES2_SetRenderMode" not in body:
-                      body=body.replace("pfglBegin(","R_GLES2_SetRenderMode(1);\n\tpfglBegin(",1)
-                      body=body.replace("pfglEnd();","pfglEnd();\n\tR_GLES2_SetRenderMode(0);",1)
-                  return body
-              src=re.sub(r'(void R_Draw_Fill\s*\([^)]*\)\s*\{[^}]*\})',patch_fill,src,flags=re.DOTALL)
-              with open(path,"w") as f: f.write(src)
-          PYEOF
-
-      # -----------------------------------------------------------------------
-      # 8. wolf_renderer.c — sprites -> mode 2
-      # -----------------------------------------------------------------------
-      - name: Patch wolf_renderer.c render modes
-        run: |
-          python3 - <<'PYEOF'
+              if "R_GLES2_SetRenderMode(1)" not in src:
+                  def pf(m):
+                      b=m.group(0)
+                      if "R_GLES2_SetRenderMode" not in b:
+                          b=b.replace("pfglBegin(","R_GLES2_SetRenderMode(1);\n\tpfglBegin(",1)
+                          b=b.replace("pfglEnd();","pfglEnd();\n\tR_GLES2_SetRenderMode(0);",1)
+                      return b
+                  src=re.sub(r'(void R_Draw_Fill\s*\([^)]*\)\s*\{[^}]*\})',pf,src,flags=re.DOTALL)
+                  with open(path,"w") as f: f.write(src)
+          except: pass
           path = "wolf3d/code/wolf/wolf_renderer.c"
           try:
               with open(path,"r") as f: src=f.read()
-          except: exit(0)
-          if "R_GLES2_SetRenderMode(2)" not in src:
-              src=src.replace("glEnable( GL_BLEND );",
-                  "glEnable( GL_BLEND );\n\tR_GLES2_SetRenderMode(2);\n\tR_GLES2_SetAlphaRef(0.1f);")
-              src=src.replace("glDisable( GL_BLEND );",
-                  "glDisable( GL_BLEND );\n\tR_GLES2_SetRenderMode(0);\n\tR_GLES2_SetAlphaRef(0.0f);")
-              with open(path,"w") as f: f.write(src)
+              if "R_GLES2_SetRenderMode(2)" not in src:
+                  src=src.replace("glEnable( GL_BLEND );",
+                      "glEnable( GL_BLEND );\n\tR_GLES2_SetRenderMode(2);\n\tR_GLES2_SetAlphaRef(0.1f);")
+                  src=src.replace("glDisable( GL_BLEND );",
+                      "glDisable( GL_BLEND );\n\tR_GLES2_SetRenderMode(0);\n\tR_GLES2_SetAlphaRef(0.0f);")
+                  with open(path,"w") as f: f.write(src)
+          except: pass
           PYEOF
 
       # -----------------------------------------------------------------------
-      # 9. Commit + push (встроенный git, без внешних actions)
+      # 7. xcconfig — форсируем armv7 и отключаем подпись на уровне clang
       # -----------------------------------------------------------------------
-      - name: Commit and push
+      - name: Write wolf3d_override.xcconfig
+        run: |
+          cat > wolf3d/code/iphone/wolf3d_override.xcconfig << EOF
+          // Override xcconfig для GitHub Actions build
+          // Форсирует armv7 и отключает code signing
+
+          ARCHS = armv7
+          VALID_ARCHS = armv7
+          ONLY_ACTIVE_ARCH = NO
+          IPHONEOS_DEPLOYMENT_TARGET = ${SDK_VERSION:-4.3}
+
+          // Отключаем подпись полностью
+          CODE_SIGNING_ALLOWED = NO
+          CODE_SIGNING_REQUIRED = NO
+          CODE_SIGN_IDENTITY =
+          AD_HOC_CODE_SIGNING_ALLOWED = YES
+          PROVISIONING_PROFILE =
+          PROVISIONING_PROFILE_SPECIFIER =
+
+          // Разрешаем старый armv7 clang флаг
+          OTHER_CFLAGS = -target armv7-apple-ios${SDK_VERSION:-4.3} -w
+          OTHER_LDFLAGS = -target armv7-apple-ios${SDK_VERSION:-4.3}
+          EOF
+
+      # -----------------------------------------------------------------------
+      # 8. Commit sources
+      # -----------------------------------------------------------------------
+      - name: Commit patched sources
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -404,7 +500,8 @@ jobs:
             wolf3d/code/iphone/EAGLView.m \
             wolf3d/code/iphone/EAGLView.h \
             wolf3d/code/iphone/gles_glue.c \
-            wolf3d/code/iphone/gles_glue.h || true
+            wolf3d/code/iphone/gles_glue.h \
+            wolf3d/code/iphone/wolf3d_override.xcconfig || true
 
           for f in \
             wolf3d/code/env/opengl_main.c \
@@ -415,13 +512,133 @@ jobs:
             git add "$f" 2>/dev/null || true
           done
 
-          git diff --cached --quiet && echo "Nothing to commit" && exit 0
-
-          git commit -m "feat: ARMv7-only + full OpenGL ES 2.0 port
-
-          - ARCHS = armv7, deployment target 4.3
-          - gles_glue.c: GLSL shaders, matrix stack, immediate mode
-          - EAGLView.m: ES2 context + R_GLES2_Init()
-          - Render modes: walls=0, fill=1, sprites=2"
-
+          git diff --cached --quiet && echo "Nothing to commit" || \
+          git commit -m "feat: ARMv7 + GLES2 + iOS 4.3 deployment target"
           git push origin HEAD:${{ github.ref_name }}
+
+      # -----------------------------------------------------------------------
+      # 9. Определяем scheme
+      # -----------------------------------------------------------------------
+      - name: Detect scheme
+        id: xcode_info
+        run: |
+          XCODEPROJ="wolf3d/code/iphone/wolf3d.xcodeproj"
+          echo "=== Schemes ==="
+          xcodebuild -project "$XCODEPROJ" -list 2>&1 || true
+          SCHEME=$(xcodebuild -project "$XCODEPROJ" -list 2>/dev/null \
+            | awk '/Schemes:/,0' | grep -v 'Schemes:' | grep -v '^$' \
+            | head -1 | xargs)
+          echo "scheme=$SCHEME" >> $GITHUB_OUTPUT
+          echo "Scheme: $SCHEME"
+
+      # -----------------------------------------------------------------------
+      # 10. Build
+      # -----------------------------------------------------------------------
+      - name: Build
+        run: |
+          XCODEPROJ="wolf3d/code/iphone/wolf3d.xcodeproj"
+          SCHEME="${{ steps.xcode_info.outputs.scheme }}"
+          BUILD_DIR="$GITHUB_WORKSPACE/build"
+          SDK_VER="${SDK_VERSION:-4.3}"
+          mkdir -p "$BUILD_DIR"
+
+          # Узнаём какой SDK реально доступен
+          AVAIL_SDK=$(xcodebuild -showsdks 2>/dev/null \
+            | grep iphoneos | grep -oE 'iphoneos[0-9.]+' \
+            | sort -V | head -1)
+          echo "Using SDK: $AVAIL_SDK"
+
+          xcodebuild \
+            -project "$XCODEPROJ" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk "${AVAIL_SDK:-iphoneos}" \
+            -xcconfig "wolf3d/code/iphone/wolf3d_override.xcconfig" \
+            SYMROOT="$BUILD_DIR" \
+            OBJROOT="$BUILD_DIR/obj" \
+            ARCHS="armv7" \
+            VALID_ARCHS="armv7" \
+            ONLY_ACTIVE_ARCH="NO" \
+            IPHONEOS_DEPLOYMENT_TARGET="$SDK_VER" \
+            CODE_SIGNING_ALLOWED="NO" \
+            CODE_SIGNING_REQUIRED="NO" \
+            CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE="" \
+            clean build \
+            2>&1 | tee "$BUILD_DIR/build.log" | grep -E "(error:|warning:|Build succeeded|FAILED|Compiling)" | tail -80
+
+          echo "=== Result ==="
+          find "$BUILD_DIR" -name "*.app" 2>/dev/null | head -5
+
+      # -----------------------------------------------------------------------
+      # 11. Package .ipa
+      # -----------------------------------------------------------------------
+      - name: Package .ipa
+        id: ipa
+        run: |
+          BUILD_DIR="$GITHUB_WORKSPACE/build"
+          APP_PATH=$(find "$BUILD_DIR" -name "*.app" -not -path "*/Simulator/*" \
+            -maxdepth 8 | head -1)
+          [ -z "$APP_PATH" ] && { echo "ERROR: .app not found"; find "$BUILD_DIR" -maxdepth 5; exit 1; }
+
+          APP_NAME=$(basename "$APP_PATH" .app)
+          IPA_DIR="$BUILD_DIR/ipa_staging"
+          mkdir -p "$IPA_DIR/Payload"
+          cp -R "$APP_PATH" "$IPA_DIR/Payload/"
+
+          IPA_PATH="$BUILD_DIR/${APP_NAME}_armv7_ios43_unsigned.ipa"
+          cd "$IPA_DIR" && zip -qr "$IPA_PATH" Payload/
+
+          echo "ipa_path=$IPA_PATH" >> $GITHUB_OUTPUT
+          echo "ipa_name=$(basename $IPA_PATH)" >> $GITHUB_OUTPUT
+          echo "Created: $(basename $IPA_PATH) ($(du -sh $IPA_PATH | cut -f1))"
+
+      # -----------------------------------------------------------------------
+      # 12. Upload artifact
+      # -----------------------------------------------------------------------
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Wolf3D-armv7-ios43-unsigned
+          path: ${{ steps.ipa.outputs.ipa_path }}
+          retention-days: 30
+
+      # -----------------------------------------------------------------------
+      # 13. Commit IPA to repo + GitHub Release
+      # -----------------------------------------------------------------------
+      - name: Commit IPA and create Release
+        run: |
+          mkdir -p release
+          cp "${{ steps.ipa.outputs.ipa_path }}" "release/${{ steps.ipa.outputs.ipa_name }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "release/${{ steps.ipa.outputs.ipa_name }}"
+          git diff --cached --quiet && echo "IPA already committed" || \
+          git commit -m "release: ${{ steps.ipa.outputs.ipa_name }}"
+          git push origin HEAD:${{ github.ref_name }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: armv7-gles2-ios43
+          name: "Wolf3D-iOS ARMv7 + GLES2 + iOS 4.3 (unsigned)"
+          body: |
+            ## Wolf3D-iOS — ARMv7 + OpenGL ES 2.0, deployment target iOS 4.3
+
+            **Unsigned IPA** — установить через Sideloadly / AltStore / Filza (jailbreak)
+
+            ### Изменения
+            - `ARCHS = armv7` (iPhone 3GS / 4 / 4S)
+            - `IPHONEOS_DEPLOYMENT_TARGET = 4.3`
+            - OpenGL ES 1.1 → ES 2.0 GLSL шейдеры
+            - iPhoneOS4.3.sdk из theos/sdks
+
+            ### Установка
+            - **Sideloadly**: перетащи .ipa, введи Apple ID
+            - **AltStore**: импорт через Files
+            - **Jailbreak**: Filza → `/var/mobile/...`
+          files: ${{ steps.ipa.outputs.ipa_path }}
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
