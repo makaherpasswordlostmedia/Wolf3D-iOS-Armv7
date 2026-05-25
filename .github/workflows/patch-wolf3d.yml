@@ -1,0 +1,697 @@
+name: Patch Wolf3D-iOS (ARMv7 + GLES2)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 1. project.pbxproj — ARMv7 only
+      # -----------------------------------------------------------------------
+      - name: Patch project.pbxproj (ARMv7 only)
+        run: |
+          PBXPROJ="wolf3d/code/iphone/wolf3d.xcodeproj/project.pbxproj"
+          perl -i -pe '
+            s/ARCHS\s*=\s*"[^"]*";/ARCHS = armv7;/g;
+            s/ARCHS\s*=\s*\$\(ARCHS_STANDARD[^)]*\);/ARCHS = armv7;/g;
+            s/ARCHS\s*=\s*\S+;(?!\s*\/)/ARCHS = armv7;/g;
+            s/VALID_ARCHS\s*=\s*"[^"]*";/VALID_ARCHS = armv7;/g;
+            s/VALID_ARCHS\s*=\s*\S+;(?!\s*\/)/VALID_ARCHS = armv7;/g;
+            s/IPHONEOS_DEPLOYMENT_TARGET\s*=\s*[\d.]+;/IPHONEOS_DEPLOYMENT_TARGET = 4.3;/g;
+            s/TARGETED_DEVICE_FAMILY\s*=\s*"1,2";/TARGETED_DEVICE_FAMILY = 1;/g;
+            s/TARGETED_DEVICE_FAMILY\s*=\s*2;/TARGETED_DEVICE_FAMILY = 1;/g;
+          ' "$PBXPROJ"
+          python3 - <<'PYEOF'
+          import re
+          path = "wolf3d/code/iphone/wolf3d.xcodeproj/project.pbxproj"
+          with open(path,"r",encoding="utf-8") as f: content=f.read()
+          def inject_archs(m):
+              block=m.group(0)
+              if "ARCHS" not in block:
+                  block=block.replace("buildSettings = {",
+                      "buildSettings = {\n\t\t\t\tARCHS = armv7;\n\t\t\t\tVALID_ARCHS = armv7;",1)
+              return block
+          new=re.sub(r'isa = XCBuildConfiguration;.*?buildSettings = \{.*?\}',inject_archs,content,flags=re.DOTALL)
+          with open(path,"w",encoding="utf-8") as f: f.write(new)
+          PYEOF
+          echo "project.pbxproj patched"
+
+      # -----------------------------------------------------------------------
+      # 2. gles_glue.h — новый заголовок
+      # -----------------------------------------------------------------------
+      - name: Write gles_glue.h
+        run: |
+          cat > wolf3d/code/iphone/gles_glue.h << 'EOF'
+          #ifndef GLES_GLUE_H
+          #define GLES_GLUE_H
+          #include <OpenGLES/ES2/gl.h>
+          #include <OpenGLES/ES2/glext.h>
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+          /* Init/shutdown */
+          void R_GLES2_Init(void);
+          void R_GLES2_Shutdown(void);
+          /* Shader modes:
+               0 = texture * vertex color  (walls, HUD)
+               1 = vertex color only       (floor/ceiling fill)
+               2 = sprite alpha blend      (transparent sprites)  */
+          void R_GLES2_SetRenderMode(int mode);
+          void R_GLES2_SetAlphaRef(float ref);
+          /* Immediate-mode emulation */
+          void pfglBegin(GLenum prim);
+          void pfglEnd(void);
+          void pfglVertex3f(float x,float y,float z);
+          void pfglVertex2f(float x,float y);
+          void pfglTexCoord2f(float s,float t);
+          void pfglColor4f(float r,float g,float b,float a);
+          void pfglColor4ub(GLubyte r,GLubyte g,GLubyte b,GLubyte a);
+          void pfglColor3f(float r,float g,float b);
+          /* Matrix stack */
+          void qglMatrixMode(GLenum mode);
+          void qglLoadIdentity(void);
+          void qglLoadMatrixf(const float *m);
+          void qglMultMatrixf(const float *m);
+          void qglOrtho(float l,float r,float b,float t,float n,float f);
+          void qglFrustum(float l,float r,float b,float t,float n,float f);
+          void qglTranslatef(float x,float y,float z);
+          void qglScalef(float x,float y,float z);
+          void qglRotatef(float a,float x,float y,float z);
+          void qglPushMatrix(void);
+          void qglPopMatrix(void);
+          /* No-op stubs for ES1 client state */
+          void pfglEnableClientState(GLenum cap);
+          void pfglDisableClientState(GLenum cap);
+          void qglEnableClientState(GLenum cap);
+          void qglDisableClientState(GLenum cap);
+          void pfglVertexPointer(GLint s,GLenum t,GLsizei st,const void *p);
+          void pfglTexCoordPointer(GLint s,GLenum t,GLsizei st,const void *p);
+          void pfglColorPointer(GLint s,GLenum t,GLsizei st,const void *p);
+          void qglTexEnvf(GLenum tgt,GLenum pname,GLfloat param);
+          void qglTexEnvi(GLenum tgt,GLenum pname,GLint param);
+          void qglAlphaFunc(GLenum func,GLclampf ref);
+          /* Compatibility aliases */
+          #define qglBegin      pfglBegin
+          #define qglEnd        pfglEnd
+          #define qglVertex3f   pfglVertex3f
+          #define qglVertex2f   pfglVertex2f
+          #define qglTexCoord2f pfglTexCoord2f
+          #define qglColor4f    pfglColor4f
+          #define qglColor4ub   pfglColor4ub
+          #define qglColor3f    pfglColor3f
+          /* ES2 lacks these enums */
+          #ifndef GL_MODELVIEW
+          #define GL_MODELVIEW  0x1700
+          #endif
+          #ifndef GL_PROJECTION
+          #define GL_PROJECTION 0x1701
+          #endif
+          #ifdef __cplusplus
+          }
+          #endif
+          #endif /* GLES_GLUE_H */
+          EOF
+          echo "gles_glue.h written"
+
+      # -----------------------------------------------------------------------
+      # 3. gles_glue.c — полная ES2 реализация с шейдерами
+      # -----------------------------------------------------------------------
+      - name: Write gles_glue.c (ES2 shaders + immediate mode + matrix stack)
+        run: |
+          cat > wolf3d/code/iphone/gles_glue.c << 'EOF'
+          /*
+           * gles_glue.c  -  OpenGL ES 2.0 glue for Wolf3D-iOS
+           *
+           * Vertex shader  : a_position / a_texcoord / a_color + u_mvpMatrix
+           * Fragment shader: 3 render modes via u_renderMode uniform
+           *   0 = texture2D * vertex_color   (walls, HUD sprites)
+           *   1 = vertex_color only           (R_Draw_Fill: ceiling/floor)
+           *   2 = texture alpha * vertex      (transparent sprites + alpha discard)
+           *
+           * Matrix stack replaces: glMatrixMode / glOrtho / glFrustum /
+           *                        glPushMatrix / glPopMatrix / glRotatef etc.
+           *
+           * Immediate mode replaces: pfglBegin/End/Vertex3f/TexCoord2f/Color4f
+           *   (original code used vertex arrays internally already,
+           *    we keep the same Vertex struct layout for drop-in replacement)
+           */
+          #include "gles_glue.h"
+          #include <string.h>
+          #include <stdio.h>
+          #include <math.h>
+
+          /* ================================================================
+           * Vertex layout — matches original gles_glue.c struct
+           * ================================================================ */
+          typedef struct {
+              float   xyz[3];   /* offset  0, size 12 */
+              float   st[2];    /* offset 12, size  8 */
+              GLubyte c[4];     /* offset 20, size  4 */
+          } Vertex;             /* total: 24 bytes    */
+
+          #define MAX_VERTS 16384
+
+          static Vertex  immediate[MAX_VERTS];
+          static int     curr_vertex = 0;
+          static GLenum  curr_prim   = GL_TRIANGLES;
+          static Vertex  g_cur;   /* accumulates TexCoord+Color between Vertex calls */
+
+          /* ================================================================
+           * Matrix stack
+           * ================================================================ */
+          #define MAT_STACK_DEPTH 16
+
+          typedef enum { MM_MODELVIEW = 0, MM_PROJECTION = 1 } MatMode;
+          static MatMode g_matMode  = MM_MODELVIEW;
+          static float   g_matMV[MAT_STACK_DEPTH][16];
+          static float   g_matPR[MAT_STACK_DEPTH][16];
+          static int     g_mvDepth  = 0;
+          static int     g_prDepth  = 0;
+
+          static float *CurMat(void) {
+              return (g_matMode == MM_PROJECTION) ? g_matPR[g_prDepth]
+                                                  : g_matMV[g_mvDepth];
+          }
+
+          static void mat_identity(float *m) {
+              memset(m, 0, 16 * sizeof(float));
+              m[0] = m[5] = m[10] = m[15] = 1.0f;
+          }
+
+          /* column-major multiply: out = a * b */
+          static void mat_mul(float *out, const float *a, const float *b) {
+              float t[16];
+              for (int row = 0; row < 4; row++)
+                  for (int col = 0; col < 4; col++) {
+                      float s = 0;
+                      for (int k = 0; k < 4; k++)
+                          s += a[row + k*4] * b[k + col*4];
+                      t[row + col*4] = s;
+                  }
+              memcpy(out, t, 16 * sizeof(float));
+          }
+
+          /* ================================================================
+           * Shader program
+           * ================================================================ */
+          static GLuint g_prog = 0;
+          static GLuint g_vbo  = 0;
+
+          static GLint g_aPos  = -1;   /* attribute: xyz   */
+          static GLint g_aTC   = -1;   /* attribute: st    */
+          static GLint g_aCol  = -1;   /* attribute: color */
+
+          static GLint g_uMVP  = -1;   /* uniform: mat4  u_mvpMatrix  */
+          static GLint g_uTex  = -1;   /* uniform: int   u_texture    */
+          static GLint g_uMode = -1;   /* uniform: int   u_renderMode */
+          static GLint g_uARef = -1;   /* uniform: float u_alphaRef   */
+
+          /* ---- Inline GLSL source ---------------------------------------- */
+          static const char * const k_vert =
+              "attribute vec3 a_position;\n"
+              "attribute vec2 a_texcoord;\n"
+              "attribute vec4 a_color;\n"
+              "uniform   mat4 u_mvpMatrix;\n"
+              "varying   vec2 v_texcoord;\n"
+              "varying   vec4 v_color;\n"
+              "void main() {\n"
+              "    gl_Position = u_mvpMatrix * vec4(a_position, 1.0);\n"
+              "    v_texcoord  = a_texcoord;\n"
+              "    v_color     = a_color;\n"
+              "}\n";
+
+          static const char * const k_frag =
+              "precision mediump float;\n"
+              "uniform sampler2D u_texture;\n"
+              "uniform int       u_renderMode;\n"
+              "uniform float     u_alphaRef;\n"
+              "varying vec2 v_texcoord;\n"
+              "varying vec4 v_color;\n"
+              "void main() {\n"
+              "    vec4 color;\n"
+              "    if (u_renderMode == 1) {\n"
+              /* mode 1: solid color fill (ceiling / floor) */
+              "        color = v_color;\n"
+              "    } else if (u_renderMode == 2) {\n"
+              /* mode 2: sprite — multiply tex alpha by vertex alpha,
+                         discard fully transparent fragments            */
+              "        vec4 t = texture2D(u_texture, v_texcoord);\n"
+              "        color = vec4(t.rgb * v_color.rgb, t.a * v_color.a);\n"
+              "        if (color.a <= u_alphaRef) discard;\n"
+              "    } else {\n"
+              /* mode 0: textured wall / HUD (GL_MODULATE equivalent) */
+              "        color = texture2D(u_texture, v_texcoord) * v_color;\n"
+              "    }\n"
+              "    gl_FragColor = color;\n"
+              "}\n";
+
+          static GLuint mk_shader(GLenum type, const char *src) {
+              GLuint s = glCreateShader(type);
+              glShaderSource(s, 1, &src, NULL);
+              glCompileShader(s);
+              GLint ok = 0;
+              glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+              if (!ok) {
+                  char log[512];
+                  glGetShaderInfoLog(s, sizeof(log), NULL, log);
+                  printf("Wolf3D shader error: %s\n", log);
+              }
+              return s;
+          }
+
+          /* ================================================================
+           * Public: R_GLES2_Init / Shutdown / SetRenderMode / SetAlphaRef
+           * ================================================================ */
+          void R_GLES2_Init(void) {
+              GLuint vs = mk_shader(GL_VERTEX_SHADER,   k_vert);
+              GLuint fs = mk_shader(GL_FRAGMENT_SHADER, k_frag);
+
+              g_prog = glCreateProgram();
+              glAttachShader(g_prog, vs);
+              glAttachShader(g_prog, fs);
+              /* bind locations before link so external code can use 0,1,2 */
+              glBindAttribLocation(g_prog, 0, "a_position");
+              glBindAttribLocation(g_prog, 1, "a_texcoord");
+              glBindAttribLocation(g_prog, 2, "a_color");
+              glLinkProgram(g_prog);
+              glDeleteShader(vs);
+              glDeleteShader(fs);
+
+              GLint ok = 0;
+              glGetProgramiv(g_prog, GL_LINK_STATUS, &ok);
+              if (!ok) {
+                  char log[512];
+                  glGetProgramInfoLog(g_prog, sizeof(log), NULL, log);
+                  printf("Wolf3D program link error: %s\n", log);
+                  return;
+              }
+
+              glUseProgram(g_prog);
+
+              g_aPos  = glGetAttribLocation (g_prog, "a_position");
+              g_aTC   = glGetAttribLocation (g_prog, "a_texcoord");
+              g_aCol  = glGetAttribLocation (g_prog, "a_color");
+              g_uMVP  = glGetUniformLocation(g_prog, "u_mvpMatrix");
+              g_uTex  = glGetUniformLocation(g_prog, "u_texture");
+              g_uMode = glGetUniformLocation(g_prog, "u_renderMode");
+              g_uARef = glGetUniformLocation(g_prog, "u_alphaRef");
+
+              glUniform1i(g_uTex,  0);
+              glUniform1i(g_uMode, 0);
+              glUniform1f(g_uARef, 0.0f);
+
+              /* VBO for upload — sized for worst-case immediate buffer */
+              glGenBuffers(1, &g_vbo);
+              glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+              glBufferData(GL_ARRAY_BUFFER, sizeof(immediate), NULL, GL_DYNAMIC_DRAW);
+              glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+              mat_identity(g_matMV[0]);
+              mat_identity(g_matPR[0]);
+              g_mvDepth = g_prDepth = 0;
+
+              /* default vertex color = white opaque */
+              g_cur.c[0] = g_cur.c[1] = g_cur.c[2] = g_cur.c[3] = 255;
+          }
+
+          void R_GLES2_Shutdown(void) {
+              if (g_vbo)  { glDeleteBuffers(1, &g_vbo);  g_vbo  = 0; }
+              if (g_prog) { glDeleteProgram(g_prog);      g_prog = 0; }
+          }
+
+          void R_GLES2_SetRenderMode(int mode) { glUniform1i(g_uMode, mode); }
+          void R_GLES2_SetAlphaRef(float ref)   { glUniform1f(g_uARef, ref);  }
+
+          /* ================================================================
+           * Internal: upload combined MVP = Projection * ModelView
+           * ================================================================ */
+          static void upload_mvp(void) {
+              float mvp[16];
+              mat_mul(mvp, g_matPR[g_prDepth], g_matMV[g_mvDepth]);
+              glUniformMatrix4fv(g_uMVP, 1, GL_FALSE, mvp);
+          }
+
+          /* ================================================================
+           * Immediate-mode emulation
+           * pfglBegin / pfglEnd / pfglVertex3f / pfglTexCoord2f / pfglColor4f
+           * ================================================================ */
+          void pfglBegin(GLenum prim) {
+              curr_vertex = 0;
+              curr_prim   = prim;
+          }
+
+          void pfglEnd(void) {
+              if (curr_vertex == 0) return;
+
+              upload_mvp();
+
+              glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+              glBufferSubData(GL_ARRAY_BUFFER, 0,
+                              curr_vertex * sizeof(Vertex), immediate);
+
+              glEnableVertexAttribArray(g_aPos);
+              glEnableVertexAttribArray(g_aTC);
+              glEnableVertexAttribArray(g_aCol);
+
+              /* Vertex layout: xyz@0, st@12, c@20, stride=24 */
+              glVertexAttribPointer(g_aPos, 3, GL_FLOAT,
+                                    GL_FALSE, sizeof(Vertex), (const void*)0);
+              glVertexAttribPointer(g_aTC,  2, GL_FLOAT,
+                                    GL_FALSE, sizeof(Vertex), (const void*)12);
+              glVertexAttribPointer(g_aCol, 4, GL_UNSIGNED_BYTE,
+                                    GL_TRUE,  sizeof(Vertex), (const void*)20);
+
+              glDrawArrays(curr_prim, 0, curr_vertex);
+
+              glDisableVertexAttribArray(g_aPos);
+              glDisableVertexAttribArray(g_aTC);
+              glDisableVertexAttribArray(g_aCol);
+              glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+              curr_vertex = 0;
+          }
+
+          void pfglTexCoord2f(float s, float t) {
+              g_cur.st[0] = s;
+              g_cur.st[1] = t;
+          }
+
+          void pfglVertex3f(float x, float y, float z) {
+              if (curr_vertex >= MAX_VERTS) return;
+              g_cur.xyz[0] = x;
+              g_cur.xyz[1] = y;
+              g_cur.xyz[2] = z;
+              immediate[curr_vertex++] = g_cur;
+          }
+
+          void pfglVertex2f(float x, float y) {
+              pfglVertex3f(x, y, 0.0f);
+          }
+
+          void pfglColor4f(float r, float g, float b, float a) {
+              g_cur.c[0] = (GLubyte)(r * 255.0f);
+              g_cur.c[1] = (GLubyte)(g * 255.0f);
+              g_cur.c[2] = (GLubyte)(b * 255.0f);
+              g_cur.c[3] = (GLubyte)(a * 255.0f);
+          }
+
+          void pfglColor4ub(GLubyte r, GLubyte g, GLubyte b, GLubyte a) {
+              g_cur.c[0] = r;
+              g_cur.c[1] = g;
+              g_cur.c[2] = b;
+              g_cur.c[3] = a;
+          }
+
+          void pfglColor3f(float r, float g, float b) {
+              pfglColor4f(r, g, b, 1.0f);
+          }
+
+          /* ================================================================
+           * Matrix stack
+           * ================================================================ */
+          void qglMatrixMode(GLenum mode) {
+              g_matMode = (mode == GL_PROJECTION) ? MM_PROJECTION : MM_MODELVIEW;
+          }
+
+          void qglLoadIdentity(void) {
+              mat_identity(CurMat());
+          }
+
+          void qglLoadMatrixf(const float *m) {
+              memcpy(CurMat(), m, 16 * sizeof(float));
+          }
+
+          void qglMultMatrixf(const float *m) {
+              float *c = CurMat(), tmp[16];
+              memcpy(tmp, c, 64);
+              mat_mul(c, tmp, m);
+          }
+
+          void qglOrtho(float l, float r, float b, float t, float n, float f) {
+              float m[16] = {0};
+              m[0]  =  2.0f / (r - l);
+              m[5]  =  2.0f / (t - b);
+              m[10] = -2.0f / (f - n);
+              m[12] = -(r + l) / (r - l);
+              m[13] = -(t + b) / (t - b);
+              m[14] = -(f + n) / (f - n);
+              m[15] =  1.0f;
+              qglMultMatrixf(m);
+          }
+
+          void qglFrustum(float l, float r, float b, float t, float n, float f) {
+              float m[16] = {0};
+              m[0]  =  (2.0f * n) / (r - l);
+              m[5]  =  (2.0f * n) / (t - b);
+              m[8]  =  (r + l) / (r - l);
+              m[9]  =  (t + b) / (t - b);
+              m[10] = -(f + n) / (f - n);
+              m[11] = -1.0f;
+              m[14] = -(2.0f * f * n) / (f - n);
+              qglMultMatrixf(m);
+          }
+
+          void qglTranslatef(float x, float y, float z) {
+              float m[16]; mat_identity(m);
+              m[12] = x; m[13] = y; m[14] = z;
+              qglMultMatrixf(m);
+          }
+
+          void qglScalef(float x, float y, float z) {
+              float m[16]; mat_identity(m);
+              m[0] = x; m[5] = y; m[10] = z;
+              qglMultMatrixf(m);
+          }
+
+          void qglRotatef(float angle, float x, float y, float z) {
+              float len = sqrtf(x*x + y*y + z*z);
+              if (len == 0.0f) return;
+              x /= len; y /= len; z /= len;
+              float rad = angle * (float)(3.14159265358979323846 / 180.0);
+              float c = cosf(rad), s = sinf(rad), ic = 1.0f - c;
+              float m[16] = {0};
+              m[0]  = x*x*ic + c;   m[1]  = y*x*ic + z*s; m[2]  = z*x*ic - y*s;
+              m[4]  = x*y*ic - z*s; m[5]  = y*y*ic + c;   m[6]  = z*y*ic + x*s;
+              m[8]  = x*z*ic + y*s; m[9]  = y*z*ic - x*s; m[10] = z*z*ic + c;
+              m[15] = 1.0f;
+              qglMultMatrixf(m);
+          }
+
+          void qglPushMatrix(void) {
+              if (g_matMode == MM_PROJECTION) {
+                  if (g_prDepth < MAT_STACK_DEPTH - 1) {
+                      memcpy(g_matPR[g_prDepth+1], g_matPR[g_prDepth], 64);
+                      g_prDepth++;
+                  }
+              } else {
+                  if (g_mvDepth < MAT_STACK_DEPTH - 1) {
+                      memcpy(g_matMV[g_mvDepth+1], g_matMV[g_mvDepth], 64);
+                      g_mvDepth++;
+                  }
+              }
+          }
+
+          void qglPopMatrix(void) {
+              if (g_matMode == MM_PROJECTION) {
+                  if (g_prDepth > 0) g_prDepth--;
+              } else {
+                  if (g_mvDepth > 0) g_mvDepth--;
+              }
+          }
+
+          /* ================================================================
+           * No-op stubs — ES1 client-state / texenv / alphafunc
+           * ================================================================ */
+          void pfglEnableClientState(GLenum c)  { (void)c; }
+          void pfglDisableClientState(GLenum c) { (void)c; }
+          void qglEnableClientState(GLenum c)   { (void)c; }
+          void qglDisableClientState(GLenum c)  { (void)c; }
+
+          void pfglVertexPointer(GLint s,GLenum t,GLsizei st,const void *p)
+              { (void)s;(void)t;(void)st;(void)p; }
+          void pfglTexCoordPointer(GLint s,GLenum t,GLsizei st,const void *p)
+              { (void)s;(void)t;(void)st;(void)p; }
+          void pfglColorPointer(GLint s,GLenum t,GLsizei st,const void *p)
+              { (void)s;(void)t;(void)st;(void)p; }
+
+          /* glTexEnvf(GL_MODULATE) — handled by shader mode 0 (default) */
+          void qglTexEnvf(GLenum tgt,GLenum pname,GLfloat param) { (void)tgt;(void)pname;(void)param; }
+          void qglTexEnvi(GLenum tgt,GLenum pname,GLint param)   { (void)tgt;(void)pname;(void)param; }
+
+          /* glAlphaFunc — forwarded to u_alphaRef uniform in fragment shader */
+          void qglAlphaFunc(GLenum func, GLclampf ref) {
+              R_GLES2_SetAlphaRef((func == GL_GREATER) ? ref : 0.0f);
+          }
+          EOF
+          echo "gles_glue.c written"
+
+      # -----------------------------------------------------------------------
+      # 4. EAGLView.m
+      # -----------------------------------------------------------------------
+      - name: Patch EAGLView.m
+        run: |
+          F="wolf3d/code/iphone/EAGLView.m"
+          [ -f "$F" ] || { echo "not found"; exit 0; }
+          perl -i -pe '
+            s/kEAGLRenderingAPIOpenGLES1/kEAGLRenderingAPIOpenGLES2/g;
+            s|<OpenGLES/ES1/gl\.h>|<OpenGLES/ES2/gl.h>|g;
+            s|<OpenGLES/ES1/glext\.h>|<OpenGLES/ES2/glext.h>|g;
+          ' "$F"
+          perl -i -0pe '
+            s/if\s*\(\s*!\s*context\s*\)\s*\{[^}]*kEAGLRenderingAPIOpenGLES1[^}]*\}\s*//gs;
+          ' "$F"
+          python3 - <<'PYEOF'
+          path = "wolf3d/code/iphone/EAGLView.m"
+          with open(path,"r") as f: src=f.read()
+          if "gles_glue.h" not in src:
+              src='#include "gles_glue.h"\n'+src
+          if "R_GLES2_Init" not in src:
+              src=src.replace("[EAGLContext setCurrentContext:context];",
+                  "[EAGLContext setCurrentContext:context];\n\tR_GLES2_Init();")
+          with open(path,"w") as f: f.write(src)
+          PYEOF
+          echo "EAGLView.m patched"
+
+      # -----------------------------------------------------------------------
+      # 5. EAGLView.h
+      # -----------------------------------------------------------------------
+      - name: Patch EAGLView.h
+        run: |
+          F="wolf3d/code/iphone/EAGLView.h"
+          [ -f "$F" ] || exit 0
+          perl -i -pe '
+            s|<OpenGLES/ES1/gl\.h>|<OpenGLES/ES2/gl.h>|g;
+            s|<OpenGLES/ES1/glext\.h>|<OpenGLES/ES2/glext.h>|g;
+            s/kEAGLRenderingAPIOpenGLES1/kEAGLRenderingAPIOpenGLES2/g;
+          ' "$F"
+
+      # -----------------------------------------------------------------------
+      # 6. Renderer .c files — update headers, add gles_glue.h include
+      # -----------------------------------------------------------------------
+      - name: Patch renderer sources
+        run: |
+          for f in \
+            wolf3d/code/env/opengl_main.c \
+            wolf3d/code/env/opengl_draw.c \
+            wolf3d/code/env/opengl_texture.c \
+            wolf3d/code/wolf/wolf_renderer.c \
+            wolf3d/code/iphone/wolf_opengl.c; do
+            [ -f "$f" ] || continue
+            perl -i -pe '
+              s|<OpenGLES/ES1/gl\.h>|<OpenGLES/ES2/gl.h>|g;
+              s|<OpenGLES/ES1/glext\.h>|<OpenGLES/ES2/glext.h>|g;
+            ' "$f"
+            python3 -c "
+          import re, sys
+          path='$f'
+          with open(path,'r') as fh: src=fh.read()
+          if 'gles_glue.h' not in src:
+              src='#include \"gles_glue.h\"\n'+src
+              with open(path,'w') as fh: fh.write(src)
+            "
+            echo "patched: $f"
+          done
+
+      # -----------------------------------------------------------------------
+      # 7. opengl_draw.c — R_Draw_Fill (ceiling/floor) needs mode 1
+      # -----------------------------------------------------------------------
+      - name: Patch opengl_draw.c render modes
+        run: |
+          python3 - <<'PYEOF'
+          import re
+          path = "wolf3d/code/env/opengl_draw.c"
+          try:
+              with open(path,"r") as f: src=f.read()
+          except:
+              exit(0)
+          if "R_GLES2_SetRenderMode(1)" not in src:
+              def patch_fill(m):
+                  body = m.group(0)
+                  if "R_GLES2_SetRenderMode" not in body:
+                      body = body.replace("pfglBegin(",
+                          "R_GLES2_SetRenderMode(1);\n\tpfglBegin(", 1)
+                      body = body.replace("pfglEnd();",
+                          "pfglEnd();\n\tR_GLES2_SetRenderMode(0);", 1)
+                  return body
+              src = re.sub(
+                  r'(void R_Draw_Fill\s*\([^)]*\)\s*\{[^}]*\})',
+                  patch_fill, src, flags=re.DOTALL)
+              with open(path,"w") as f: f.write(src)
+          print("opengl_draw.c render modes patched")
+          PYEOF
+
+      # -----------------------------------------------------------------------
+      # 8. wolf_renderer.c — sprite drawing needs mode 2 + alpha ref
+      # -----------------------------------------------------------------------
+      - name: Patch wolf_renderer.c render modes
+        run: |
+          python3 - <<'PYEOF'
+          path = "wolf3d/code/wolf/wolf_renderer.c"
+          try:
+              with open(path,"r") as f: src=f.read()
+          except:
+              exit(0)
+          if "R_GLES2_SetRenderMode(2)" not in src:
+              src = src.replace(
+                  "glEnable( GL_BLEND );",
+                  "glEnable( GL_BLEND );\n\tR_GLES2_SetRenderMode(2);\n\tR_GLES2_SetAlphaRef(0.1f);"
+              )
+              src = src.replace(
+                  "glDisable( GL_BLEND );",
+                  "glDisable( GL_BLEND );\n\tR_GLES2_SetRenderMode(0);\n\tR_GLES2_SetAlphaRef(0.0f);"
+              )
+              with open(path,"w") as f: f.write(src)
+          print("wolf_renderer.c render modes patched")
+          PYEOF
+
+      # -----------------------------------------------------------------------
+      # 9. Commit + push
+      # -----------------------------------------------------------------------
+      - name: Show diff
+        run: git diff --stat
+
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add \
+            wolf3d/code/iphone/wolf3d.xcodeproj/project.pbxproj \
+            wolf3d/code/iphone/EAGLView.m \
+            wolf3d/code/iphone/EAGLView.h \
+            wolf3d/code/iphone/gles_glue.c \
+            wolf3d/code/iphone/gles_glue.h || true
+          for f in \
+            wolf3d/code/env/opengl_main.c \
+            wolf3d/code/env/opengl_draw.c \
+            wolf3d/code/env/opengl_texture.c \
+            wolf3d/code/wolf/wolf_renderer.c \
+            wolf3d/code/iphone/wolf_opengl.c; do
+            git add "$f" 2>/dev/null || true
+          done
+          git diff --cached --quiet && echo "Nothing to commit" && exit 0
+          git commit -m "feat: ARMv7-only + full OpenGL ES 2.0 port with GLSL shaders
+
+          gles_glue.c — полная замена ES1 fixed-function на ES2:
+          - Vertex shader: a_position/a_texcoord/a_color + u_mvpMatrix
+          - Fragment shader: 3 режима (tex*color, color-only, sprite-alpha)
+          - Матричный стек: qglOrtho/Frustum/Rotate/Translate/Push/Pop
+          - Immediate mode: pfglBegin/End/Vertex3f/TexCoord2f/Color4f/Color4ub
+          - No-ops: ClientState/TexEnvf/VertexPointer/TexCoordPointer
+          - glAlphaFunc -> u_alphaRef uniform (discard в шейдере)
+          - R_Draw_Fill -> mode 1 (vertex color only)
+          - Sprites -> mode 2 (texture alpha + discard)
+
+          project.pbxproj: ARCHS=armv7, deployment target 4.3
+          EAGLView.m: ES2 context + R_GLES2_Init()"
+
+      - name: Push
+        uses: ad-m/github-push-action@v0.8.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ github.ref_name }}
